@@ -1,223 +1,161 @@
 package eureka
 
-//File  : client.go
-//Author: dong
-//Describe: eureka client for server
-//Date  : 2020/12/3
-
 import (
-	"encoding/json"
 	"log"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
-var (
-	instanceId string
-	// define eureka path
-	eurekaPath = "/eureka/apps/"
-	// local eureka url
-	discoveryServerUrl = "http://127.0.0.1:8761"
-)
-
-// RegisterClient register this app at the Eureka server
-// params: eurekaUrl, eureka server url
-// params: appName define your app name what you want
-// params: port app instance port
-// params: securePort
-func RegisterClient(eurekaUrl string, localip string, appName string, port string, securePort string) {
-	eurekaUrl = strings.Trim(eurekaUrl, "/")
-	discoveryServerUrl = eurekaUrl
-	RegisterLocal(appName, localip, port, securePort)
+// Client eureka客户端
+type Client struct {
+	// for monitor system signal
+	signalChan chan os.Signal
+	mutex      sync.RWMutex
+	Running    bool
+	Config     *Config
+	// eureka服务中注册的应用
+	Applications *Applications
 }
 
-// RegisterLocal :register your app at the local Eureka server
-// params: port app instance port
-// params: securePort
-// Register new application instance
-// POST /eureka/v2/apps/appID
-// Input: JSON/XML payload HTTP Code: 204 on success
-func RegisterLocal(appName string, localip string, port string, securePort string) {
-	appName = strings.ToUpper(appName)
-	cfg := newConfig(appName, localip, port, securePort)
-
-	// define Register request
-	registerAction := RequestAction{
-		Url:         discoveryServerUrl + eurekaPath + appName,
-		Method:      "POST",
-		ContentType: "application/json;charset=UTF-8",
-		Body:        cfg,
+// Start 启动时注册客户端，并后台刷新服务列表，以及心跳
+func (c *Client) Start() {
+	c.mutex.Lock()
+	c.Running = true
+	c.mutex.Unlock()
+	// 注册
+	if err := c.doRegister(); err != nil {
+		log.Println(err.Error())
+		return
 	}
-	var result bool
-	// loop send heart beat every 5s
+	log.Println("Register application instance successful")
+	// 刷新服务列表
+	go c.refresh()
+	// 心跳
+	go c.heartbeat()
+	// 监听退出信号，自动删除注册信息
+	go c.handleSignal()
+}
+
+// refresh 刷新服务列表
+func (c *Client) refresh() {
 	for {
-		result = isDoHttpRequest(registerAction)
-		if result {
-			log.Println("Registration OK")
-			handleSigterm(appName)
-			go startHeartbeat(appName)
-			break
+		if c.Running {
+			if err := c.doRefresh(); err != nil {
+				log.Println(err)
+			} else {
+				log.Println("Refresh application instance successful")
+			}
 		} else {
-			log.Println("Registration attempt of " + appName + " failed...")
-			time.Sleep(time.Second * 5)
+			break
 		}
-	}
-
-}
-
-// GetServiceInstances is a function query all instances by appName
-// params: appName
-// Query for all appID instances
-// GET /eureka/v2/apps/appID
-// HTTP Code: 200 on success Output: JSON
-func GetServiceInstances(appName string) ([]Instance, error) {
-	var m ServiceResponse
-	appName = strings.ToUpper(appName)
-	// define get instance request
-	requestAction := RequestAction{
-		Url:         discoveryServerUrl + eurekaPath + appName,
-		Method:      "GET",
-		Accept:      "application/json;charset=UTF-8",
-		ContentType: "application/json;charset=UTF-8",
-	}
-	log.Println("Query Eureka server using URL: " + requestAction.Url)
-	bytes, err := executeQuery(requestAction)
-	if len(bytes) == 0 {
-		log.Printf("Query Eureka Response is None")
-		return nil, err
-	}
-	if err != nil {
-		return nil, err
-	} else {
-		//log.Println("Response from Eureka:\n" + string(bytes))
-		err := json.Unmarshal(bytes, &m)
-		if err != nil {
-			log.Printf("Parse JSON Error(%v) from Eureka Server Response", err.Error())
-			return nil, err
-		}
-		return m.Application.Instance, nil
+		sleep := time.Duration(c.Config.RegistryFetchIntervalSeconds)
+		time.Sleep(sleep * time.Second)
 	}
 }
 
-// GetServiceInstanceIdWithappName : in this function, we can get InstanceId by appName
-// Notes:
-//		1. use sendheartbeat
-// 		2. deregister
-// return instanceId, lastDirtyTimestamp
-func GetInfoWithappName(appName string) (string, string, error) {
-	appName = strings.ToUpper(appName)
-	instances, err := GetServiceInstances(appName)
-	if err != nil {
-		return "", "", err
-	}
-	for _, ins := range instances {
-		if ins.App == appName {
-			return ins.InstanceId, ins.LastDirtyTimestamp, nil
-		}
-	}
-	return "", "", err
-}
-
-// GetServices :get all services for eureka
-// Notes: /gotest/TestGetServiceInstances has a test case
-// Query for all instances
-// GET /eureka/v2/apps
-// HTTP Code: 200 on success Output: JSON
-func GetServices() ([]Application, error) {
-	var m ApplicationsRootResponse
-	requestAction := RequestAction{
-		Url:         discoveryServerUrl + eurekaPath,
-		Method:      "GET",
-		Accept:      "application/json;charset=UTF-8",
-		ContentType: "application/json;charset=UTF-8",
-	}
-	log.Println("Query all services URL:" + requestAction.Url)
-	bytes, err := executeQuery(requestAction)
-	if err != nil {
-		return nil, err
-	} else {
-		//log.Println("query all services response from Eureka:\n" + string(bytes))
-		err := json.Unmarshal(bytes, &m)
-		if err != nil {
-			log.Printf("Parse JSON Error(%v) from Eureka Server Response", err.Error())
-			return nil, err
-		}
-		return m.Resp.Applications, nil
-	}
-}
-
-// startHeartbeat function will start as goroutine, will loop indefinitely until application exits.
-// params: appName
-func startHeartbeat(appName string) {
+// heartbeat 心跳
+func (c *Client) heartbeat() {
 	for {
-		time.Sleep(time.Second * 30)
-		Sendheartbeat(appName)
-	}
-}
-
-// heartbeat Send application instance heartbeat
-// PUT /eureka/v2/apps/appID/instanceID
-//HTTP Code:
-//* 200 on success
-//* 404 if instanceID doesn’t exist
-func heartbeat(appName string) {
-	appName = strings.ToUpper(appName)
-	instanceId, lastDirtyTimestamp, err := GetInfoWithappName(appName)
-	if instanceId == "" {
-		log.Printf("instanceId is None , Please check at (%v) \n", discoveryServerUrl)
-		return
-	}
-	if err != nil {
-		log.Printf("Can't get instanceId from Eureka server by appName \n")
-		return
-	} else {
-		heartbeatAction := RequestAction{
-			//http://127.0.0.1:8761/eureka/apps/TORNADO-SERVER/127.0.0.1:tornado-server:3333/status?value=UP&lastDirtyTimestamp=1607321668458
-			Url:         discoveryServerUrl + eurekaPath + appName + "/" + instanceId + "/status?value=UP&lastDirtyTimestamp=" + lastDirtyTimestamp,
-			Method:      "PUT",
-			ContentType: "application/json;charset=UTF-8",
+		if c.Running {
+			if err := c.doHeartbeat(); err != nil {
+				log.Println(err)
+			} else {
+				log.Println("Heartbeat application instance successful")
+			}
+		} else {
+			break
 		}
-		log.Println("Sending heartbeat to " + heartbeatAction.Url)
-		isDoHttpRequest(heartbeatAction)
+		sleep := time.Duration(c.Config.RenewalIntervalInSecs)
+		time.Sleep(sleep * time.Second)
 	}
 }
 
-// Sendheartbeat is a test case for heartbeat
-// you can test this function: send a heart beat to eureka server
-func Sendheartbeat(appName string) {
-	heartbeat(appName)
+func (c *Client) doRegister() error {
+	instance := c.Config.instance
+	return Register(c.Config.DefaultZone, c.Config.App, instance)
 }
 
-// deregister De-register application instance
-// DELETE /eureka/v2/apps/appID/instanceID
-// HTTP Code: 200 on success
-func deregister(appName string) {
-	appName = strings.ToUpper(appName)
-	log.Println("Trying to deregister application " + appName)
-	instanceId, lastDirtyTimestamp, _ := GetInfoWithappName(appName)
-	// cancel registerion
-	deregisterAction := RequestAction{
-		//http://127.0.0.1:8761/eureka/apps/TORNADO-SERVER/127.0.0.1:tornado-server:3333/status?value=UP&lastDirtyTimestamp=1607321668458
-		Url:         discoveryServerUrl + eurekaPath + appName + "/" + instanceId + "/status?value=UP&lastDirtyTimestamp=" + lastDirtyTimestamp,
-		ContentType: "application/json;charset=UTF-8",
-		Method:      "DELETE",
+func (c *Client) doUnRegister() error {
+	instance := c.Config.instance
+	return UnRegister(c.Config.DefaultZone, instance.App, instance.InstanceID)
+}
+
+func (c *Client) doHeartbeat() error {
+	instance := c.Config.instance
+	return Heartbeat(c.Config.DefaultZone, instance.App, instance.InstanceID)
+}
+
+func (c *Client) doRefresh() error {
+	// todo If the delta is disabled or if it is the first time, get all applications
+
+	// get all applications
+	applications, err := Refresh(c.Config.DefaultZone)
+	if err != nil {
+		return err
 	}
-	isDoHttpRequest(deregisterAction)
-	log.Println("Deregistered App: " + appName)
+
+	// set applications
+	c.mutex.Lock()
+	c.Applications = applications
+	c.mutex.Unlock()
+	return nil
 }
 
-// handleSigterm when has signal os Interrupt eureka would exit
-func handleSigterm(appName string) {
-	c := make(chan os.Signal, 1)
-	// Ctr+C shut down
-	signal.Notify(c, os.Interrupt)
-	signal.Notify(c, syscall.SIGTERM)
-	go func() {
-		<-c
-		deregister(appName)
-		os.Exit(1)
-	}()
+// handleSignal 监听退出信号，删除注册的实例
+func (c *Client) handleSignal() {
+	if c.signalChan == nil {
+		c.signalChan = make(chan os.Signal)
+	}
+	signal.Notify(c.signalChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGKILL)
+	for {
+		switch <-c.signalChan {
+		case syscall.SIGINT:
+			fallthrough
+		case syscall.SIGKILL:
+			fallthrough
+		case syscall.SIGTERM:
+			log.Println("Receive exit signal, client instance going to de-egister")
+			err := c.doUnRegister()
+			if err != nil {
+				log.Println(err.Error())
+			} else {
+				log.Println("UnRegister application instance successful")
+			}
+			os.Exit(0)
+		}
+	}
+}
+
+// NewClient 创建客户端
+func NewClient(config *Config) *Client {
+	defaultConfig(config)
+	config.instance = NewInstance(getLocalIP(), config)
+	return &Client{Config: config}
+}
+
+func defaultConfig(config *Config) {
+	if config.DefaultZone == "" {
+		config.DefaultZone = "http://localhost:8761/eureka/"
+	}
+	if config.RenewalIntervalInSecs == 0 {
+		config.RenewalIntervalInSecs = 30
+	}
+	if config.RegistryFetchIntervalSeconds == 0 {
+		config.RegistryFetchIntervalSeconds = 15
+	}
+	if config.DurationInSecs == 0 {
+		config.DurationInSecs = 90
+	}
+	if config.App == "" {
+		config.App = "server"
+	} else {
+		config.App = strings.ToLower(config.App)
+	}
+	if config.Port == 0 {
+		config.Port = 80
+	}
 }

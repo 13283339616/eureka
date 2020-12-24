@@ -1,0 +1,5 @@
+package eureka
+
+func init() {
+
+}
